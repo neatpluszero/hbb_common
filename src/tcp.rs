@@ -121,7 +121,21 @@ impl FramedStream {
         local_addr: Option<SocketAddr>,
         ms_timeout: u64,
     ) -> ResultType<Self> {
-        for remote_addr in lookup_host(&remote_addr).await? {
+        // RFC 8305 Happy Eyeballs. A dual-stack name resolves to several addresses;
+        // trying them one at a time with the full timeout each lets an unreachable
+        // leading candidate - typically an AAAA with no route, as on an IPv4-only
+        // hotspot behind a dual-stack name - hold the entire timeout before the
+        // working A record is tried, failing the whole connect with "deadline has
+        // elapsed". Race the candidates with a short stagger instead. A single
+        // resolved address keeps the original single-attempt path untouched.
+        let addrs: Vec<SocketAddr> = lookup_host(&remote_addr).await?.collect();
+        if addrs.len() > 1 {
+            if let Some(stream) = Self::race_connect(&addrs, local_addr, ms_timeout).await {
+                return Ok(stream);
+            }
+            bail!(format!("Failed to connect to {remote_addr}"));
+        }
+        for remote_addr in addrs {
             let local = if let Some(addr) = local_addr {
                 addr
             } else {
@@ -143,6 +157,52 @@ impl FramedStream {
             }
         }
         bail!(format!("Failed to connect to {remote_addr}"));
+    }
+
+    /// Connect to the first of several resolved addresses to answer, starting the
+    /// attempts with a short stagger (RFC 8305). Each attempt keeps the full
+    /// `ms_timeout` and they run concurrently, so a slow-but-valid address is still
+    /// given its full budget while an unreachable one no longer blocks the rest.
+    /// Returns `None` only if every address fails; the losing attempts are aborted
+    /// when the `JoinSet` drops.
+    async fn race_connect(
+        addrs: &[SocketAddr],
+        local_addr: Option<SocketAddr>,
+        ms_timeout: u64,
+    ) -> Option<Self> {
+        const STAGGER_MS: u64 = 250;
+        let mut set = tokio::task::JoinSet::new();
+        for (i, remote_addr) in addrs.iter().copied().enumerate() {
+            set.spawn(async move {
+                if i > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(STAGGER_MS * i as u64))
+                        .await;
+                }
+                let local = match local_addr {
+                    Some(addr) => addr,
+                    None => crate::config::Config::get_any_listen_addr(remote_addr.is_ipv4()),
+                };
+                let socket = new_socket(local, true).ok()?;
+                let stream = super::timeout(ms_timeout, socket.connect(remote_addr))
+                    .await
+                    .ok()?
+                    .ok()?;
+                stream.set_nodelay(true).ok();
+                let addr = stream.local_addr().ok()?;
+                Some(Self(
+                    Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::new()),
+                    addr,
+                    None,
+                    0,
+                ))
+            });
+        }
+        while let Some(res) = set.join_next().await {
+            if let Ok(Some(stream)) = res {
+                return Some(stream);
+            }
+        }
+        None
     }
 
     pub async fn connect<'t, T>(
