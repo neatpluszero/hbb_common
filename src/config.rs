@@ -2473,10 +2473,7 @@ impl UserDefaultConfig {
 
     pub fn get(&self, key: &str) -> String {
         match key {
-            #[cfg(any(target_os = "android", target_os = "ios"))]
             keys::OPTION_VIEW_STYLE => self.get_string(key, "adaptive", vec!["original"]),
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            keys::OPTION_VIEW_STYLE => self.get_string(key, "original", vec!["adaptive"]),
             keys::OPTION_SCROLL_STYLE => {
                 self.get_string(key, "scrollauto", vec!["scrolledge", "scrollbar"])
             }
@@ -3731,6 +3728,20 @@ mod tests {
             let cfg = toml::from_str::<PeerConfig>(wrong_field_str);
             assert_eq!(cfg, Ok(cfg_to_compare), "Failed to test wrong_field_str");
         }
+    }
+
+    #[test]
+    fn test_default_view_style_is_adaptive() {
+        // New users (no stored default) get the adaptive view style on every platform.
+        assert_eq!(
+            UserDefaultConfig::default().get(keys::OPTION_VIEW_STYLE),
+            "adaptive"
+        );
+        // An explicitly chosen "original" default is still honored.
+        let mut cfg = UserDefaultConfig::default();
+        cfg.options
+            .insert(keys::OPTION_VIEW_STYLE.to_string(), "original".to_string());
+        assert_eq!(cfg.get(keys::OPTION_VIEW_STYLE), "original");
     }
 
     #[test]
